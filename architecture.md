@@ -1,3 +1,4 @@
+```mermaid
 graph TB
     User[Пользователь]
 
@@ -48,6 +49,7 @@ graph TB
 
     Celery <--> Ranking
     Celery <--> Redis
+```
 
     Bot -.-> Mon
     Profile -.-> Mon

@@ -49,10 +49,9 @@ graph TB
 
     Celery <--> Ranking
     Celery <--> Redis
-```
-
     Bot -.-> Mon
     Profile -.-> Mon
     Ranking -.-> Mon
     EventProc -.-> Mon
     Celery -.-> Mon
+```

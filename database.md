@@ -1,3 +1,4 @@
+```mermaid
 erDiagram
     users {
         bigint id PK
@@ -69,3 +70,4 @@ erDiagram
     users ||--o{ interactions : "receives"
     users ||--o{ referrals : "makes"
     users ||--o{ referrals : "accepts"
+```

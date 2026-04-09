@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dating
+      POSTGRES_PASSWORD: dating
+      POSTGRES_DB: dating_bot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dating -d dating_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

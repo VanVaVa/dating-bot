@@ -174,10 +174,67 @@ export function createBot(token: string, redis: FeedCacheClient): Bot {
 
     const [type, toUserId] = ctx.callbackQuery.data.split(":") as ["like" | "skip", string];
     await ranking.saveInteraction(user.id, toUserId, type);
+
+    if (type === "like") {
+      await notifyLikeRecipient(user.id, toUserId);
+    }
+
     await ctx.answerCallbackQuery({
       text: type === "like" ? "Лайк отправлен" : "Анкета пропущена",
     });
     await showNextCandidate(ctx, user.id);
+  });
+
+  bot.callbackQuery(/^like_reply:(yes|no):([0-9a-f-]+)$/, async (ctx) => {
+    const from = ctx.from;
+    if (!from) return;
+
+    const recipient = await users.findByTelegramId(from.id);
+    if (!recipient) {
+      await ctx.answerCallbackQuery({ text: "Сначала выполните /start." });
+      return;
+    }
+
+    const [, decision, initiatorId] = ctx.callbackQuery.data.match(
+      /^like_reply:(yes|no):([0-9a-f-]+)$/,
+    ) ?? [null, null, null];
+
+    if (!decision || !initiatorId) {
+      await ctx.answerCallbackQuery({ text: "Некорректный ответ на лайк." });
+      return;
+    }
+
+    const initiator = await userRepo.findOne({ where: { id: initiatorId } });
+    if (!initiator) {
+      await ctx.answerCallbackQuery({ text: "Инициатор лайка не найден." });
+      return;
+    }
+
+    if (decision === "no") {
+      await ranking.saveInteraction(recipient.id, initiator.id, "skip");
+      await ctx.answerCallbackQuery({ text: "Вы отклонили лайк." });
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => undefined);
+      await ctx.reply("Лайк отклонен.");
+      return;
+    }
+
+    await ranking.saveInteraction(recipient.id, initiator.id, "like");
+    await ctx.answerCallbackQuery({ text: "Взаимный лайк отправлен." });
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => undefined);
+
+    await ctx.reply(
+      `Отлично, это взаимный лайк.\nTelegram ID инициатора: ${initiator.telegramId}`,
+    );
+
+    const opponentNick = initiatorDisplayNick(recipient);
+    await bot.api
+      .sendMessage(
+        Number(initiator.telegramId),
+        `Вам ответили взаимным лайком.\nНик оппонента: ${opponentNick}`,
+      )
+      .catch((error) => {
+        console.error("Не удалось отправить уведомление инициатору:", error);
+      });
   });
 
   bot.callbackQuery(/^profile_gender:(male|female|other)$/, async (ctx) => {
@@ -415,6 +472,27 @@ export function createBot(token: string, redis: FeedCacheClient): Bot {
     await ctx.reply(`Ваши последние лайки:\n\n${lines.join("\n")}`, {
       reply_markup: mainMenuKeyboard(),
     });
+  }
+
+  async function notifyLikeRecipient(fromUserId: string, toUserId: string): Promise<void> {
+    const initiator = await userRepo.findOne({ where: { id: fromUserId } });
+    const recipient = await userRepo.findOne({ where: { id: toUserId } });
+    if (!initiator || !recipient) return;
+
+    const keyboard = new InlineKeyboard()
+      .text("👍 Ответить взаимностью", `like_reply:yes:${initiator.id}`)
+      .text("👎 Отклонить", `like_reply:no:${initiator.id}`);
+
+    const senderNick = initiatorDisplayNick(initiator);
+    await bot.api
+      .sendMessage(
+        Number(recipient.telegramId),
+        `Вам поставили лайк.\nИнициатор: ${senderNick}\nОтветить на лайк?`,
+        { reply_markup: keyboard },
+      )
+      .catch((error) => {
+        console.error("Не удалось отправить уведомление о лайке:", error);
+      });
   }
 }
 
@@ -715,4 +793,10 @@ function fromPreferredGenderCode(code: string): string | null {
 function toTitleCase(value: string): string {
   const trimmed = value.trim();
   return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}
+
+function initiatorDisplayNick(user: User): string {
+  if (user.username) return `@${user.username}`;
+  if (user.firstName) return user.firstName;
+  return `user_${user.telegramId}`;
 }

@@ -5,6 +5,8 @@ export interface FeedCacheClient {
   rPush(key: string, elements: string[]): Promise<unknown>;
   expire(key: string, seconds: number): Promise<unknown>;
   lPop(key: string): Promise<string | null>;
+  /** Счётчики аналитики / метрик продукта (отдельно от очередей ленты `feed:*`). */
+  incr(key: string): Promise<number>;
 }
 
 export class FeedCacheService {

@@ -4,8 +4,15 @@ import { GrammyError } from "grammy";
 import { createClient } from "redis";
 import { AppDataSource } from "./data-source.js";
 import { createBot } from "./bot/bot.js";
-import { FeedCacheClient } from "./services/feed-cache.service.js";
+import { createConfiguredPhotoStorage, createEventPublisher } from "./messaging/factory.js";
+import type { PhotoStorageService } from "./services/photo-storage.service.js";
+import {
+  listenMetricsHttp,
+  telegramUpdatesTotal,
+} from "./monitoring/metrics-http.js";
+import type { FeedCacheClient } from "./services/feed-cache.service.js";
 
+type RedisDriver = ReturnType<typeof createClient>;
 const token = process.env.BOT_TOKEN;
 if (!token) {
   console.error("Задайте BOT_TOKEN в .env");
@@ -21,41 +28,81 @@ if (!redisUrl) {
   process.exit(1);
 }
 
+let photoStorage: PhotoStorageService | null = createConfiguredPhotoStorage();
+if (photoStorage) {
+  try {
+    await photoStorage.ensureBucket();
+    console.log("[photos] MinIO/S3 бакет готов к загрузке изображений");
+  } catch (error) {
+    console.warn(
+      "[photos] Не удалось автоматически создать бакет, отключаем фото до решения ошибки:",
+      error,
+    );
+    photoStorage = null;
+  }
+}
+
+const metricsPortRaw = Number.parseInt(process.env.METRICS_HTTP_PORT ?? "9100", 10);
+const metricsEnabled = Number.isFinite(metricsPortRaw) && metricsPortRaw > 0;
+const metricsLifecycle = metricsEnabled ? await listenMetricsHttp(metricsPortRaw) : null;
+if (!metricsLifecycle) {
+  console.warn("[metrics] HTTP-экспорт Prometheus отключён (METRICS_HTTP_PORT ≤ 0 или порт занят).");
+}
+
+
+const publisher = createEventPublisher();
+
+function wrapRedisFeedCache(driver: RedisDriver): FeedCacheClient {
+  return {
+    del: (key) => driver.del(key),
+    rPush: (key, elements) => driver.rPush(key, elements),
+    expire: (key, seconds) => driver.expire(key, seconds),
+    lPop: (key) => driver.lPop(key),
+    incr: (key) => driver.incr(key),
+  };
+}
+
 const inMemoryFeedCache = (): FeedCacheClient => {
-  const store = new Map<string, string[]>();
+  const lists = new Map<string, string[]>();
+  const counters = new Map<string, number>();
   return {
     async del(key: string) {
-      store.delete(key);
+      lists.delete(key);
       return 1;
     },
     async rPush(key: string, elements: string[]) {
-      const existing = store.get(key) ?? [];
+      const existing = lists.get(key) ?? [];
       existing.push(...elements);
-      store.set(key, existing);
+      lists.set(key, existing);
       return existing.length;
     },
-    async expire() {
+    async expire(_key: string, _seconds: number) {
       return 1;
     },
     async lPop(key: string) {
-      const existing = store.get(key);
+      const existing = lists.get(key);
       if (!existing?.length) {
         return null;
       }
       const value = existing.shift() ?? null;
       if (!existing.length) {
-        store.delete(key);
+        lists.delete(key);
       } else {
-        store.set(key, existing);
+        lists.set(key, existing);
       }
       return value;
+    },
+    async incr(key: string) {
+      const next = (counters.get(key) ?? 0) + 1;
+      counters.set(key, next);
+      return next;
     },
   };
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function connectRedisWithRetries(url: string, attempts = 8): Promise<FeedCacheClient | null> {
+async function connectRedisWithRetries(url: string, attempts = 8): Promise<RedisDriver | null> {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const redis = createClient({
       url,
@@ -100,14 +147,37 @@ async function connectRedisWithRetries(url: string, attempts = 8): Promise<FeedC
   return null;
 }
 
-const redisClient = await connectRedisWithRetries(redisUrl);
-const cacheClient: FeedCacheClient = redisClient ?? inMemoryFeedCache();
+const redisDriver = await connectRedisWithRetries(redisUrl);
+const cacheClient: FeedCacheClient = redisDriver ? wrapRedisFeedCache(redisDriver) : inMemoryFeedCache();
 
-if (!redisClient) {
+if (!redisDriver) {
   console.error("Redis недоступен после повторных попыток, использую in-memory кэш ленты.");
 }
 
-const bot = createBot(token, cacheClient);
+const bot = createBot(token, cacheClient, publisher, photoStorage);
+
+bot.use(async (ctx, next) => {
+  const descriptor = categorizeUpdate(ctx.update);
+  telegramUpdatesTotal.labels(descriptor).inc();
+  await next();
+});
+
+async function shutdown(reason: string): Promise<void> {
+  console.warn(`Завершение процесса: ${reason}`);
+  await bot.stop();
+  await publisher.close().catch(() => undefined);
+  await redisDriver?.disconnect().catch(() => undefined);
+  await metricsLifecycle?.close().catch(() => undefined);
+  await AppDataSource.destroy().catch(() => undefined);
+  process.exit(0);
+}
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT");
+});
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
 
 try {
   await bot.start({
@@ -129,5 +199,21 @@ try {
   } else {
     console.error("Ошибка при запуске long polling:", err);
   }
+  await publisher.close().catch(() => undefined);
+  await redisDriver?.disconnect().catch(() => undefined);
+  await metricsLifecycle?.close().catch(() => undefined);
   process.exit(1);
+}
+
+function categorizeUpdate(update: {
+  message?: unknown;
+  edited_message?: unknown;
+  callback_query?: unknown;
+  inline_query?: unknown;
+}): string {
+  if (update.message) return "message";
+  if (update.callback_query) return "callback_query";
+  if (update.edited_message) return "edited_message";
+  if (update.inline_query) return "inline_query";
+  return "other";
 }

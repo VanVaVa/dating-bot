@@ -5,6 +5,8 @@ import { AppDataSource } from "../data-source.js";
 import { Interaction } from "../entities/Interaction.js";
 import { Rating } from "../entities/Rating.js";
 import { User } from "../entities/User.js";
+import { UserMetric } from "../entities/UserMetric.js";
+import { NoopEventPublisher } from "../messaging/noop-publisher.js";
 import { RankingService } from "../services/ranking.service.js";
 
 type MockUser = {
@@ -206,7 +208,15 @@ async function main() {
   const userRepo = AppDataSource.getRepository(User);
   const interactionRepo = AppDataSource.getRepository(Interaction);
   const ratingRepo = AppDataSource.getRepository(Rating);
-  const ranking = new RankingService(userRepo, interactionRepo, ratingRepo);
+  const metricsRepo = AppDataSource.getRepository(UserMetric);
+  const noopPublisher = new NoopEventPublisher();
+  const ranking = new RankingService(
+    userRepo,
+    interactionRepo,
+    ratingRepo,
+    metricsRepo,
+    noopPublisher,
+  );
 
   const users = await upsertMockUsers(userRepo);
   await seedInteractions(interactionRepo, users);

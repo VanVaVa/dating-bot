@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 *.log
+infra/jmeter/results/*
+!infra/jmeter/results/.gitkeep

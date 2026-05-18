@@ -1,5 +1,7 @@
 import { Repository } from "typeorm";
 import { User } from "../entities/User.js";
+import { auditLog } from "../logging/audit-log.js";
+import type { EventPublisher } from "../messaging/domain-events.js";
 
 export interface ProfilePayload {
   age: number;
@@ -12,7 +14,10 @@ export interface ProfilePayload {
 }
 
 export class ProfileService {
-  constructor(private readonly repo: Repository<User>) {}
+  constructor(
+    private readonly repo: Repository<User>,
+    private readonly publisher: EventPublisher,
+  ) {}
 
   async upsertProfile(user: User, payload: ProfilePayload): Promise<User> {
     console.log("[profile-service] upsertProfile called", {
@@ -31,6 +36,18 @@ export class ProfileService {
     const saved = await this.repo.save(user);
     console.log("[profile-service] upsertProfile saved", {
       userId: saved.id,
+      completenessScore: saved.completenessScore,
+    });
+    await this.publisher.publish({
+      type: "profile.updated",
+      payload: {
+        userId: saved.id,
+        updatedAt: saved.updatedAt.toISOString(),
+      },
+    });
+    auditLog("profile.upsert", {
+      userId: saved.id,
+      telegramId: saved.telegramId,
       completenessScore: saved.completenessScore,
     });
     return saved;

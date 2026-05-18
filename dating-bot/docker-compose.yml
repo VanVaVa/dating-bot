@@ -1,6 +1,12 @@
+networks:
+  dating-backend:
+    name: dating-backend
+
 services:
   postgres:
     image: postgres:16-alpine
+    networks:
+      - dating-backend
     ports:
       - "5432:5432"
     environment:
@@ -17,29 +23,200 @@ services:
 
   redis:
     image: redis:7-alpine
+    networks:
+      - dating-backend
     ports:
-      - "6380:6379"
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    networks:
+      dating-backend:
+        aliases:
+          - rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: dating
+      RABBITMQ_DEFAULT_PASS: dating
+      RABBITMQ_ERLANG_COOKIE: DATINGBOTMQSHAREDSECRETVALUE012345678
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    networks:
+      - dating-backend
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   bot:
     build: .
+    networks:
+      - dating-backend
     restart: unless-stopped
     env_file:
       - .env
     environment:
       DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
-      REDIS_URL: redis://host.docker.internal:6380
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://dating:dating@rabbitmq:5672/
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: user-photos
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: miniosecret
+      METRICS_HTTP_PORT: "9100"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "9100:9100"
+
+  event-processor:
+    build: .
+    networks:
+      - dating-backend
+    command: ["node", "dist/event-processor-entry.js"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
+      RABBITMQ_URL: amqp://dating:dating@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  celery-worker:
+    build:
+      context: ./workers
+    networks:
+      - dating-backend
+    command: ["celery", "-A", "celery_app", "worker", "--loglevel=INFO"]
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: amqp://dating:dating@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  celery-beat:
+    build:
+      context: ./workers
+    networks:
+      - dating-backend
+    command: ["celery", "-A", "celery_app", "beat", "--loglevel=INFO"]
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: amqp://dating:dating@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: rpc://
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    networks:
+      - dating-backend
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    depends_on:
+      bot:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    networks:
+      - dating-backend
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      prometheus:
+        condition: service_started
+
+  # Apache JMeter — нагрузочное тестирование /metrics и /health (профиль loadtest)
+  jmeter:
+    image: justb4/jmeter:5.6.3
+    profiles:
+      - loadtest
+    networks:
+      - dating-backend
+    volumes:
+      - ./infra/jmeter/dating-bot-metrics.jmx:/test/plan.jmx:ro
+      - ./infra/jmeter/results:/results
+    depends_on:
+      bot:
+        condition: service_started
+    command:
+      - -n
+      - -t
+      - /test/plan.jmx
+      - -l
+      - /results/results.jtl
+      - -j
+      - /results/jmeter.log
+      - -e
+      - -o
+      - /results/html-report
+      - -JTARGET_HOST=bot
+      - -JTARGET_PORT=9100
+      - -JTHREADS=30
+      - -JLOOPS=20
+      - -JRAMP_UP=5
 
 volumes:
   pgdata:
+  minio-data:
+  rabbitmq-data:

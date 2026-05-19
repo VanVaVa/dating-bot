@@ -80,7 +80,8 @@ services:
       - dating-backend
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
       REDIS_URL: redis://redis:6379
@@ -109,7 +110,8 @@ services:
     command: ["node", "dist/event-processor-entry.js"]
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://dating:dating@postgres:5432/dating_bot
       RABBITMQ_URL: amqp://dating:dating@rabbitmq:5672/
